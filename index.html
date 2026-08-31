@@ -45,7 +45,17 @@
         // ═══════════════════════════════════════════════
         const SCRIPT_ADMIN      = "https://script.google.com/macros/s/AKfycbxXNv4R9lN9KeIDnQMBuHooCxdMhPHYfzDTwhiS4_rcWGg5IZAx4TDb6yZPz8y-rZeanQ/exec";
         const SCRIPT_SEGUIMIENTO = "https://script.google.com/macros/s/AKfycbxKK2f81UpeN4-n00R9w15gxreS9Kiv5qQbwj63eQDazJNSGEuWx4zIMlQ5dtMN343NAw/exec";
-        const GRADOS = ["Tercero", "Quinto", "Noveno", "Once"];
+        // ── Metadatos de grado — extensible, con fallback automático ──
+        const GRADO_INFO = {
+            'Tercero': { label: '3°',  color: 'text-green-600'  },
+            'Quinto':  { label: '5°',  color: 'text-yellow-500' },
+            'Noveno':  { label: '9°',  color: 'text-orange-500' },
+            'Decimo':  { label: '10°', color: 'text-teal-600'   },
+            'Once':    { label: '11°', color: 'text-red-600'    },
+        };
+        const ORDEN_GRADOS = { 'Tercero': 3, 'Quinto': 5, 'Noveno': 9, 'Decimo': 10, 'Once': 11 };
+        const infoGrado = (g) => GRADO_INFO[g] || { label: g, color: 'text-gray-500' };
+        const ordenarGrados = (lista) => [...lista].sort((a, b) => (ORDEN_GRADOS[a] ?? 999) - (ORDEN_GRADOS[b] ?? 999));
         const META_COBERTURA = 90;
 
         // ═══════════════════════════════════════════════
@@ -57,6 +67,7 @@
             const [filtroInstitucion, setFiltroInstitucion] = useState('');
             const [filtroInstitucionNombre, setFiltroInstitucionNombre] = useState('');
             const [filtroGrado, setFiltroGrado] = useState('');
+            const [filtroCalendario, setFiltroCalendario] = useState(''); // 'A' | 'B' | 
             const [consultorSeleccionado, setConsultorSeleccionado] = useState(null);
             const [mensaje, setMensaje] = useState({ tipo: '', texto: '' });
             const [instituciones, setInstituciones] = useState([]);
@@ -111,24 +122,45 @@
 
             const colegiosPorConsultor = useMemo(() => {
                 const map = {};
-                instituciones.forEach(inst => {
-                    const c = inst.consultor || 'Sin Asignar';
-                    if (!map[c]) map[c] = [];
-                    map[c].push(inst);
-                });
+                instituciones
+                    .filter(inst => !filtroCalendario || (inst.calendario || '').toUpperCase() === filtroCalendario)
+                    .forEach(inst => {
+                        const c = inst.consultor || 'Sin Asignar';
+                        if (!map[c]) map[c] = [];
+                        map[c].push(inst);
+                    });
                 return map;
-            }, [instituciones]);
+            }, [instituciones, filtroCalendario]);
 
             const estudiantesFiltrados = useMemo(() => {
                 return estudiantes.filter(est => {
                     if (consultorSeleccionado && obtenerConsultorPorCodigo(est.codigoInstitucion) !== consultorSeleccionado) return false;
                     if (filtroInstitucion && est.codigoInstitucion?.toString().trim() !== filtroInstitucion.toString().trim()) return false;
                     if (filtroGrado && est.grado !== filtroGrado) return false;
+                    if (filtroCalendario && (est.calendario || '').toUpperCase() !== filtroCalendario) return false;
                     return true;
                 });
-            }, [estudiantes, consultorSeleccionado, filtroInstitucion, filtroGrado, instituciones]);
+            }, [estudiantes, consultorSeleccionado, filtroInstitucion, filtroGrado, filtroCalendario, instituciones]);
 
-            const institucionesInscritas = useMemo(() => [...new Set(estudiantes.map(e => e.institucion))], [estudiantes]);
+            // Grados detectados dinámicamente desde los datos (reemplaza el arreglo GRADOS fijo)
+            const gradosActivos = useMemo(() =>
+                ordenarGrados([...new Set(estudiantes.map(e => e.grado).filter(Boolean))]),
+            [estudiantes]);
+
+            // institucionesInscritas: solo respeta el filtro de CALENDARIO (no institución/grado/consultor)
+            // — es la base del desglose "por consultor", que necesita ver todo ese calendario a la vez,
+            // no colapsar a un único colegio cuando alguien busca uno específico.
+            const institucionesInscritas = useMemo(() => {
+                const base = filtroCalendario
+                    ? estudiantes.filter(e => (e.calendario || '').toUpperCase() === filtroCalendario)
+                    : estudiantes;
+                return [...new Set(base.map(e => e.institucion))];
+            }, [estudiantes, filtroCalendario]);
+
+            // ── KPI cards: deben reflejar TODOS los filtros activos (calendario, institución, grado, consultor) ──
+            const institucionesInscritasFiltrado = useMemo(() =>
+                [...new Set(estudiantesFiltrados.map(e => e.institucion))],
+            [estudiantesFiltrados]);
 
             const calcularProgresoConsultor = (nombreConsultor) => {
                 const colegios = colegiosPorConsultor[nombreConsultor] || [];
@@ -146,8 +178,9 @@
             };
 
             const institucionesFiltradas = instituciones.filter(inst =>
-                inst.nombre.toLowerCase().includes(busquedaInst.toLowerCase()) ||
-                inst.codigo.toLowerCase().includes(busquedaInst.toLowerCase())
+                (inst.nombre.toLowerCase().includes(busquedaInst.toLowerCase()) ||
+                 inst.codigo.toLowerCase().includes(busquedaInst.toLowerCase())) &&
+                (!filtroCalendario || (inst.calendario || '').toUpperCase() === filtroCalendario)
             );
 
             const seleccionarInstitucion = (inst) => {
@@ -196,9 +229,14 @@
                 mostrarMensaje('success', '✅ Archivo descargado exitosamente');
             };
 
-            const totalInstituciones = !loadingInstituciones && instituciones.length > 0 ? instituciones.length : 95;
-            const institucionesFaltantes = totalInstituciones - institucionesInscritas.length;
-            const estudiantesConAceptacion = estudiantes.filter(e => {
+            // Denominador de instituciones: si hay filtro de calendario activo, solo cuenta
+            // las instituciones de ESE calendario — si no, el % de cobertura sale distorsionado
+            // (numerador filtrado contra un denominador que sigue siendo el total de la Red).
+            const totalInstituciones = !loadingInstituciones && instituciones.length > 0
+                ? instituciones.filter(inst => !filtroCalendario || (inst.calendario || '').toUpperCase() === filtroCalendario).length
+                : 95;
+            const institucionesFaltantes = totalInstituciones - institucionesInscritasFiltrado.length;
+            const estudiantesConAceptacion = estudiantesFiltrados.filter(e => {
                     const v = String(e.inclusion || '').trim().toLowerCase();
                       return v === 'sí' || v === 'si' || v === 's';
                         }).length;
@@ -244,37 +282,37 @@
                         }`}>{mensaje.texto}</div>
                     )}
 
-                    {/* Tarjetas de métricas — 8 tarjetas con distribución por grado */}
+                    {/* Tarjetas de métricas — 8 tarjetas con distribución por grado (respetan filtros activos) */}
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-blue-600 mb-1">{institucionesInscritas.length}</div>
+                            <div className="text-4xl font-extrabold text-blue-600 mb-1">{institucionesInscritasFiltrado.length}</div>
                             <div className="text-sm font-semibold text-gray-500">Instituciones Inscritas</div>
                             <div className="text-xs text-gray-400 mt-1">de {totalInstituciones} total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-green-600 mb-1">{estudiantes.filter(e => e.grado === 'Tercero').length.toLocaleString()}</div>
+                            <div className="text-4xl font-extrabold text-green-600 mb-1">{estudiantesFiltrados.filter(e => e.grado === 'Tercero').length.toLocaleString()}</div>
                             <div className="text-sm font-semibold text-gray-500">Grado 3°</div>
-                            <div className="text-xs text-gray-400 mt-1">{estudiantes.length > 0 ? (estudiantes.filter(e=>e.grado==='Tercero').length/estudiantes.length*100).toFixed(1) : 0}% del total</div>
+                            <div className="text-xs text-gray-400 mt-1">{estudiantesFiltrados.length > 0 ? (estudiantesFiltrados.filter(e=>e.grado==='Tercero').length/estudiantesFiltrados.length*100).toFixed(1) : 0}% del total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-yellow-500 mb-1">{estudiantes.filter(e => e.grado === 'Quinto').length.toLocaleString()}</div>
+                            <div className="text-4xl font-extrabold text-yellow-500 mb-1">{estudiantesFiltrados.filter(e => e.grado === 'Quinto').length.toLocaleString()}</div>
                             <div className="text-sm font-semibold text-gray-500">Grado 5°</div>
-                            <div className="text-xs text-gray-400 mt-1">{estudiantes.length > 0 ? (estudiantes.filter(e=>e.grado==='Quinto').length/estudiantes.length*100).toFixed(1) : 0}% del total</div>
+                            <div className="text-xs text-gray-400 mt-1">{estudiantesFiltrados.length > 0 ? (estudiantesFiltrados.filter(e=>e.grado==='Quinto').length/estudiantesFiltrados.length*100).toFixed(1) : 0}% del total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
                             <div className="text-4xl font-extrabold text-pink-600 mb-1">{estudiantesConAceptacion.toLocaleString()}</div>
                             <div className="text-sm font-semibold text-gray-500">Inclusión</div>
-                            <div className="text-xs text-gray-400 mt-1">{estudiantes.length > 0 ? (estudiantesConAceptacion/estudiantes.length*100).toFixed(1) : 0}% del total</div>
+                            <div className="text-xs text-gray-400 mt-1">{estudiantesFiltrados.length > 0 ? (estudiantesConAceptacion/estudiantesFiltrados.length*100).toFixed(1) : 0}% del total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-orange-500 mb-1">{estudiantes.filter(e => e.grado === 'Noveno').length.toLocaleString()}</div>
+                            <div className="text-4xl font-extrabold text-orange-500 mb-1">{estudiantesFiltrados.filter(e => e.grado === 'Noveno').length.toLocaleString()}</div>
                             <div className="text-sm font-semibold text-gray-500">Grado 9°</div>
-                            <div className="text-xs text-gray-400 mt-1">{estudiantes.length > 0 ? (estudiantes.filter(e=>e.grado==='Noveno').length/estudiantes.length*100).toFixed(1) : 0}% del total</div>
+                            <div className="text-xs text-gray-400 mt-1">{estudiantesFiltrados.length > 0 ? (estudiantesFiltrados.filter(e=>e.grado==='Noveno').length/estudiantesFiltrados.length*100).toFixed(1) : 0}% del total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-red-600 mb-1">{estudiantes.filter(e => e.grado === 'Once').length.toLocaleString()}</div>
+                            <div className="text-4xl font-extrabold text-red-600 mb-1">{estudiantesFiltrados.filter(e => e.grado === 'Once').length.toLocaleString()}</div>
                             <div className="text-sm font-semibold text-gray-500">Grado 11°</div>
-                            <div className="text-xs text-gray-400 mt-1">{estudiantes.length > 0 ? (estudiantes.filter(e=>e.grado==='Once').length/estudiantes.length*100).toFixed(1) : 0}% del total</div>
+                            <div className="text-xs text-gray-400 mt-1">{estudiantesFiltrados.length > 0 ? (estudiantesFiltrados.filter(e=>e.grado==='Once').length/estudiantesFiltrados.length*100).toFixed(1) : 0}% del total</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
                             <div className="text-4xl font-extrabold text-purple-600 mb-1">{institucionesFaltantes}</div>
@@ -282,10 +320,95 @@
                             <div className="text-xs text-gray-400 mt-1">de {totalInstituciones} instituciones</div>
                         </div>
                         <div className="bg-white rounded-2xl shadow-lg p-6 text-center hover:shadow-xl transition-shadow">
-                            <div className="text-4xl font-extrabold text-teal-600 mb-1">{Math.round((institucionesInscritas.length / totalInstituciones) * 100)}%</div>
+                            <div className="text-4xl font-extrabold text-teal-600 mb-1">{totalInstituciones > 0 ? Math.round((institucionesInscritasFiltrado.length / totalInstituciones) * 100) : 0}%</div>
                             <div className="text-sm font-semibold text-gray-500">Cobertura</div>
-                            <div className="text-xs text-gray-400 mt-1">{institucionesInscritas.length} / {totalInstituciones} colegios</div>
+                            <div className="text-xs text-gray-400 mt-1">{institucionesInscritasFiltrado.length} / {totalInstituciones} colegios</div>
                         </div>
+                    </div>
+
+                    {/* Filtros */}
+                    <div className="bg-white rounded-xl shadow-lg p-6">
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="text-lg font-bold text-purple-800">🔍 Filtros</h2>
+                            {(filtroInstitucion || filtroGrado || filtroCalendario || consultorSeleccionado) && (
+                                <button
+                                    onClick={() => { setFiltroInstitucion(''); setFiltroInstitucionNombre(''); setBusquedaInst(''); setFiltroGrado(''); setFiltroCalendario(''); setConsultorSeleccionado(null); }}
+                                    className="text-sm bg-red-100 hover:bg-red-200 text-red-700 px-3 py-1 rounded-lg transition font-semibold">
+                                    ✖ Limpiar todos
+                                </button>
+                            )}
+                        </div>
+                        <div className="grid md:grid-cols-3 gap-4">
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">Buscar por Institución</label>
+                                {!filtroInstitucion ? (
+                                    <div className="relative">
+                                        <input
+                                            type="text"
+                                            value={busquedaInst}
+                                            onChange={(e) => { setBusquedaInst(e.target.value); setMostrarSugerencias(true); }}
+                                            onFocus={() => setMostrarSugerencias(true)}
+                                            placeholder="Buscar institución..."
+                                            className="w-full px-4 py-3 border-2 border-purple-200 rounded-xl focus:ring-2 focus:ring-purple-400 outline-none"
+                                        />
+                                        {mostrarSugerencias && busquedaInst && institucionesFiltradas.length > 0 && (
+                                            <div className="absolute z-10 w-full mt-2 bg-white border-2 border-purple-200 rounded-xl shadow-xl max-h-60 overflow-y-auto">
+                                                {institucionesFiltradas.slice(0, 10).map((inst, idx) => (
+                                                    <button key={idx} type="button" onClick={() => seleccionarInstitucion(inst)}
+                                                        className="w-full px-4 py-3 text-left hover:bg-purple-50 border-b last:border-b-0 transition">
+                                                        <div className="font-semibold text-gray-800">{inst.nombre}</div>
+                                                        <div className="text-xs text-gray-500">Código: {inst.codigo}</div>
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="flex items-center gap-2">
+                                        <div className="flex-1 px-4 py-3 bg-purple-50 border-2 border-purple-300 rounded-xl text-gray-800 font-medium">
+                                            {filtroInstitucionNombre}
+                                            <span className="ml-2 text-xs text-gray-500 font-normal">(Cód: {filtroInstitucion})</span>
+                                        </div>
+                                        <button onClick={limpiarFiltro}
+                                            className="px-4 py-3 bg-red-500 hover:bg-red-600 text-white font-bold rounded-xl transition">✖</button>
+                                    </div>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">Filtrar por Grado</label>
+                                <select value={filtroGrado} onChange={(e) => setFiltroGrado(e.target.value)}
+                                    className="w-full px-4 py-3 border-2 border-purple-200 rounded-xl focus:ring-2 focus:ring-purple-400 outline-none">
+                                    <option value="">Todos los grados</option>
+                                    {gradosActivos.map(g => <option key={g} value={g}>{g}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">📅 Calendario</label>
+                                <div className="flex gap-2">
+                                    {['A', 'B'].map(cal => (
+                                        <button key={cal} type="button"
+                                            onClick={() => setFiltroCalendario(filtroCalendario === cal ? '' : cal)}
+                                            className={`flex-1 px-4 py-3 rounded-xl font-bold text-sm border-2 transition ${
+                                                filtroCalendario === cal
+                                                    ? 'bg-indigo-600 text-white border-indigo-600'
+                                                    : 'bg-white text-gray-600 border-gray-300 hover:border-indigo-300'
+                                            }`}>
+                                            Cal {cal}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                        {(filtroInstitucion || filtroGrado || filtroCalendario || consultorSeleccionado) && (
+                            <div className="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200 text-sm">
+                                <div className="font-semibold text-purple-800 mb-1">📊 Filtros activos:</div>
+                                {consultorSeleccionado && <div className="text-gray-700">• Consultor: <strong>{consultorSeleccionado}</strong></div>}
+                                {filtroInstitucion && <div className="text-gray-700">• Institución: <strong>{filtroInstitucionNombre}</strong></div>}
+                                {filtroGrado && <div className="text-gray-700">• Grado: <strong>{filtroGrado}</strong></div>}
+                                {filtroCalendario && <div className="text-gray-700">• Calendario: <strong>Cal {filtroCalendario}</strong></div>}
+                                <div className="mt-2 text-purple-700 font-semibold">Mostrando {estudiantesFiltrados.length} de {estudiantes.length} estudiantes</div>
+                            </div>
+                        )}
                     </div>
 
                     {/* Exportar y Actualizar */}
@@ -389,12 +512,10 @@
                                         const estudiantesConsultor = estudiantesFiltrados.filter(e =>
                                             obtenerConsultorPorCodigo(e.codigoInstitucion) === nombreConsultor
                                         );
-                                        const porGradoConsultor = GRADOS.reduce((acc, g) => {
+                                        const porGradoConsultor = gradosActivos.reduce((acc, g) => {
                                             acc[g] = estudiantesConsultor.filter(e => e.grado === g).length;
                                             return acc;
                                         }, {});
-                                        const gradoColors = { 'Tercero': 'text-green-600', 'Quinto': 'text-yellow-500', 'Noveno': 'text-orange-500', 'Once': 'text-red-600' };
-                                        const gradoLabels = { 'Tercero': '3°', 'Quinto': '5°', 'Noveno': '9°', 'Once': '11°' };
 
                                         return (
                                             <div key={nombreConsultor}
@@ -426,11 +547,11 @@
                                                     <div className={`bg-gradient-to-r ${gradienteProgreso} h-4 rounded-full transition-all`} style={{ width: `${porcentaje}%` }}></div>
                                                 </div>
                                                 {/* Desglose por grados */}
-                                                <div className="grid grid-cols-4 gap-2 mt-1">
-                                                    {GRADOS.map(g => (
+                                                <div className="grid gap-2 mt-1" style={{ gridTemplateColumns: `repeat(${gradosActivos.length}, minmax(0,1fr))` }}>
+                                                    {gradosActivos.map(g => (
                                                         <div key={g} className="bg-white bg-opacity-60 rounded-lg p-2 text-center">
-                                                            <div className={`text-lg font-extrabold ${gradoColors[g]}`}>{porGradoConsultor[g] || 0}</div>
-                                                            <div className="text-xs text-gray-500">Grado {gradoLabels[g]}</div>
+                                                            <div className={`text-lg font-extrabold ${infoGrado(g).color}`}>{porGradoConsultor[g] || 0}</div>
+                                                            <div className="text-xs text-gray-500">Grado {infoGrado(g).label}</div>
                                                         </div>
                                                     ))}
                                                 </div>
@@ -484,74 +605,6 @@
                             </div>
                         </div>
                     )}
-
-                    {/* Filtros */}
-                    <div className="bg-white rounded-xl shadow-lg p-6">
-                        <div className="flex items-center justify-between mb-4">
-                            <h2 className="text-lg font-bold text-purple-800">🔍 Filtros</h2>
-                            {(filtroInstitucion || filtroGrado || consultorSeleccionado) && (
-                                <button
-                                    onClick={() => { setFiltroInstitucion(''); setFiltroInstitucionNombre(''); setBusquedaInst(''); setFiltroGrado(''); setConsultorSeleccionado(null); }}
-                                    className="text-sm bg-red-100 hover:bg-red-200 text-red-700 px-3 py-1 rounded-lg transition font-semibold">
-                                    ✖ Limpiar todos
-                                </button>
-                            )}
-                        </div>
-                        <div className="grid md:grid-cols-2 gap-4">
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Buscar por Institución</label>
-                                {!filtroInstitucion ? (
-                                    <div className="relative">
-                                        <input
-                                            type="text"
-                                            value={busquedaInst}
-                                            onChange={(e) => { setBusquedaInst(e.target.value); setMostrarSugerencias(true); }}
-                                            onFocus={() => setMostrarSugerencias(true)}
-                                            placeholder="Buscar institución..."
-                                            className="w-full px-4 py-3 border-2 border-purple-200 rounded-xl focus:ring-2 focus:ring-purple-400 outline-none"
-                                        />
-                                        {mostrarSugerencias && busquedaInst && institucionesFiltradas.length > 0 && (
-                                            <div className="absolute z-10 w-full mt-2 bg-white border-2 border-purple-200 rounded-xl shadow-xl max-h-60 overflow-y-auto">
-                                                {institucionesFiltradas.slice(0, 10).map((inst, idx) => (
-                                                    <button key={idx} type="button" onClick={() => seleccionarInstitucion(inst)}
-                                                        className="w-full px-4 py-3 text-left hover:bg-purple-50 border-b last:border-b-0 transition">
-                                                        <div className="font-semibold text-gray-800">{inst.nombre}</div>
-                                                        <div className="text-xs text-gray-500">Código: {inst.codigo}</div>
-                                                    </button>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                ) : (
-                                    <div className="flex items-center gap-2">
-                                        <div className="flex-1 px-4 py-3 bg-purple-50 border-2 border-purple-300 rounded-xl text-gray-800 font-medium">
-                                            {filtroInstitucionNombre}
-                                            <span className="ml-2 text-xs text-gray-500 font-normal">(Cód: {filtroInstitucion})</span>
-                                        </div>
-                                        <button onClick={limpiarFiltro}
-                                            className="px-4 py-3 bg-red-500 hover:bg-red-600 text-white font-bold rounded-xl transition">✖</button>
-                                    </div>
-                                )}
-                            </div>
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Filtrar por Grado</label>
-                                <select value={filtroGrado} onChange={(e) => setFiltroGrado(e.target.value)}
-                                    className="w-full px-4 py-3 border-2 border-purple-200 rounded-xl focus:ring-2 focus:ring-purple-400 outline-none">
-                                    <option value="">Todos los grados</option>
-                                    {GRADOS.map(g => <option key={g} value={g}>{g}</option>)}
-                                </select>
-                            </div>
-                        </div>
-                        {(filtroInstitucion || filtroGrado || consultorSeleccionado) && (
-                            <div className="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200 text-sm">
-                                <div className="font-semibold text-purple-800 mb-1">📊 Filtros activos:</div>
-                                {consultorSeleccionado && <div className="text-gray-700">• Consultor: <strong>{consultorSeleccionado}</strong></div>}
-                                {filtroInstitucion && <div className="text-gray-700">• Institución: <strong>{filtroInstitucionNombre}</strong></div>}
-                                {filtroGrado && <div className="text-gray-700">• Grado: <strong>{filtroGrado}</strong></div>}
-                                <div className="mt-2 text-purple-700 font-semibold">Mostrando {estudiantesFiltrados.length} de {estudiantes.length} estudiantes</div>
-                            </div>
-                        )}
-                    </div>
 
                     {/* Listado de Estudiantes */}
                     <div className="bg-white rounded-xl shadow-lg p-6">
@@ -643,6 +696,7 @@
         function PanelSeguimiento() {
             const [estudiantes,    setEstudiantes]    = useState([]);
             const [presentaciones, setPresentaciones] = useState({});
+            const [gradosDisponibles, setGradosDisponibles] = useState([]);
             const [loading,        setLoading]        = useState(true);
             const [mensaje,        setMensaje]        = useState({ tipo: '', texto: '' });
 
@@ -650,6 +704,7 @@
             const [filtroConsultor,  setFiltroConsultor]  = useState('');
             const [filtroInstitucion,setFiltroInstitucion]= useState('');
             const [filtroGrado,      setFiltroGrado]      = useState('');
+            const [filtroCalendario, setFiltroCalendario] = useState(''); // 'A' | 'B' | ''
             const [filtroMomento,    setFiltroMomento]    = useState(''); // Entrada | Control | Salida | ''
             const [filtroEstado,     setFiltroEstado]     = useState(''); // meta_alcanzada | pendiente | ''
             const [busquedaInst,     setBusquedaInst]     = useState('');
@@ -671,6 +726,10 @@
                     if (!json.success) throw new Error(json.error || 'Error desconocido');
                     setEstudiantes(json.estudiantes || []);
                     setPresentaciones(json.presentaciones || {});
+                    // gradosDisponibles viene del backend (v2); si no llega (backend viejo), se deriva en cliente
+                    setGradosDisponibles(json.gradosDisponibles && json.gradosDisponibles.length
+                        ? json.gradosDisponibles
+                        : ordenarGrados([...new Set((json.estudiantes || []).map(e => e.grado).filter(Boolean))]));
                     setLoading(false);
                     mostrarMensaje('success', `✅ ${json.totalInscritos} inscritos cargados`);
                 } catch (error) {
@@ -713,16 +772,17 @@
                 const map = new Map();
                 estudiantesEnriquecidos.forEach(e => {
                     if (!map.has(e.codigoInstitucion))
-                        map.set(e.codigoInstitucion, { codigo: e.codigoInstitucion, nombre: e.institucion, consultor: e.consultor });
+                        map.set(e.codigoInstitucion, { codigo: e.codigoInstitucion, nombre: e.institucion, consultor: e.consultor, calendario: e.calendario || '' });
                 });
                 return Array.from(map.values()).sort((a, b) => a.nombre.localeCompare(b.nombre));
             }, [estudiantesEnriquecidos]);
 
             const institucionesBusqueda = useMemo(() =>
                 instituciones.filter(i =>
-                    i.nombre.toLowerCase().includes(busquedaInst.toLowerCase()) ||
-                    i.codigo.toLowerCase().includes(busquedaInst.toLowerCase())
-                ), [instituciones, busquedaInst]);
+                    (i.nombre.toLowerCase().includes(busquedaInst.toLowerCase()) ||
+                     i.codigo.toLowerCase().includes(busquedaInst.toLowerCase())) &&
+                    (!filtroCalendario || (i.calendario || '').toUpperCase() === filtroCalendario)
+                ), [instituciones, busquedaInst, filtroCalendario]);
 
             // ─── Filtros de contexto (NO excluyen estudiantes del universo) ───
             // El universo base siempre son todos los inscritos filtrados por consultor/institucion/grado
@@ -731,9 +791,10 @@
                     if (filtroConsultor   && est.consultor        !== filtroConsultor)   return false;
                     if (filtroInstitucion && est.codigoInstitucion !== filtroInstitucion) return false;
                     if (filtroGrado       && est.grado             !== filtroGrado)       return false;
+                    if (filtroCalendario  && (est.calendario || '').toUpperCase() !== filtroCalendario) return false;
                     return true;
                 });
-            }, [estudiantesEnriquecidos, filtroConsultor, filtroInstitucion, filtroGrado]);
+            }, [estudiantesEnriquecidos, filtroConsultor, filtroInstitucion, filtroGrado, filtroCalendario]);
 
             // Helper: ¿presentó en el momento dado?
             const presentoEn = (est, momento) => {
@@ -865,7 +926,7 @@
             }, [estudiantesBase, vistaEstudiantes, instSeleccionada, filtroMomento]);
 
             const seleccionarInstitucion = (inst) => { setFiltroInstitucion(inst.codigo); setBusquedaInst(''); setMostrarSugerencias(false); };
-            const limpiarFiltros = () => { setFiltroConsultor(''); setFiltroInstitucion(''); setFiltroGrado(''); setFiltroEstado(''); setFiltroMomento(''); setBusquedaInst(''); setVistaEstudiantes(null); setInstSeleccionada(null); };
+            const limpiarFiltros = () => { setFiltroConsultor(''); setFiltroInstitucion(''); setFiltroGrado(''); setFiltroCalendario(''); setFiltroEstado(''); setFiltroMomento(''); setBusquedaInst(''); setVistaEstudiantes(null); setInstSeleccionada(null); };
 
             const abrirDetalle = (tipo, codigoInst = null) => {
                 setVistaEstudiantes(tipo);
@@ -883,7 +944,7 @@
                             fila[`${m} - Evaluados`] = d.evaluados;
                             fila[`${m} - %`] = d.inscritos > 0 ? (d.evaluados/d.inscritos*100).toFixed(1)+'%' : '0%';
                         });
-                        GRADOS.forEach(g => {
+                        gradosDisponibles.forEach(g => {
                             const d = inst.porGrado[g] || { inscritos: 0, evaluados: 0 };
                             fila[`${g} Inscritos`] = d.inscritos;
                             fila[`${g} Evaluados`] = d.evaluados;
@@ -938,7 +999,15 @@
             // ─── Exportar Reporte Cobertura (plano: 1 fila por institución × prueba) ───
             const exportarReporteCobertura = () => {
                 try {
-                    const gradoMap = { 'Tercero': '3', 'Quinto': '5', 'Noveno': '9', 'Once': '11' };
+                    // ⚠️ COLUMNAS 0-12 SON LEGADO — NO REORDENAR.
+                    // La hoja Participacion tiene url_estudiantes/url_plan_abr en las
+                    // columnas 13-14 (se usan como links en el Portal Institucional).
+                    // Por eso los grados nuevos (Decimo, o el que sea a futuro) SIEMPRE
+                    // se agregan al final del archivo, nunca insertados entre grado9 y
+                    // grado11 — así nunca corres esas columnas de posición sin querer.
+                    const GRADOS_LEGADO = ['Tercero', 'Quinto', 'Noveno', 'Once'];
+                    const gradosExtra = gradosDisponibles.filter(g => !GRADOS_LEGADO.includes(g));
+
                     const momentosSel = MOMENTOS.filter(m => momentosExport.has(m));
                     const filas = [];
                     const instMap = new Map();
@@ -951,32 +1020,77 @@
                         momentosSel.forEach(momento => {
                             const fila = { codigo_inst: codigo, prueba: momento, consultor };
                             let totalN = 0, totalApl = 0;
-                            ['Tercero','Quinto','Noveno','Once'].forEach(g => {
+                            GRADOS_LEGADO.forEach(g => {
                                 const gEsts = ests.filter(e => e.grado === g);
                                 const n = gEsts.length;
                                 const apl = gEsts.filter(e => presentoEn(e, momento)).length;
-                                const suffix = gradoMap[g];
+                                const suffix = ORDEN_GRADOS[g];
                                 fila[`grado${suffix}_n`] = n;
                                 fila[`grado${suffix}_apl`] = apl;
                                 totalN += n; totalApl += apl;
                             });
                             fila.total_n = totalN;
                             fila.total_apl = totalApl;
+                            // Grados extra (Decimo, etc.) SIEMPRE al final de la fila
+                            gradosExtra.forEach(g => {
+                                const gEsts = ests.filter(e => e.grado === g);
+                                const suffix = ORDEN_GRADOS[g] ?? g;
+                                fila[`grado${suffix}_n`]   = gEsts.length;
+                                fila[`grado${suffix}_apl`] = gEsts.filter(e => presentoEn(e, momento)).length;
+                            });
                             filas.push(fila);
                         });
                     });
                     if (!filas.length) { mostrarMensaje('warning', 'No hay datos para exportar'); return; }
                     const wb = XLSX.utils.book_new();
-                    const ws = XLSX.utils.json_to_sheet(filas, { header: [
+
+                    // ── Pestaña 1: "Cobertura" — EXACTAMENTE las columnas de siempre (A→M).
+                    // Pega esto donde siempre lo has pegado, sin cambiar nada de tu flujo.
+                    const filasLegado = filas.map(f => ({
+                        codigo_inst: f.codigo_inst, prueba: f.prueba, consultor: f.consultor,
+                        grado3_n: f.grado3_n, grado3_apl: f.grado3_apl,
+                        grado5_n: f.grado5_n, grado5_apl: f.grado5_apl,
+                        grado9_n: f.grado9_n, grado9_apl: f.grado9_apl,
+                        grado11_n: f.grado11_n, grado11_apl: f.grado11_apl,
+                        total_n: f.total_n, total_apl: f.total_apl,
+                    }));
+                    const wsLegado = XLSX.utils.json_to_sheet(filasLegado, { header: [
                         'codigo_inst','prueba','consultor',
                         'grado3_n','grado3_apl','grado5_n','grado5_apl',
                         'grado9_n','grado9_apl','grado11_n','grado11_apl',
                         'total_n','total_apl'
                     ]});
-                    XLSX.utils.book_append_sheet(wb, ws, 'Cobertura');
+                    XLSX.utils.book_append_sheet(wb, wsLegado, 'Cobertura');
+
+                    // ── Pestaña 2: "Cobertura_GradosExtra" — SOLO si hay grados nuevos (Decimo, etc.)
+                    // Bloque separado a propósito: pégalo empezando en la columna P de Participacion,
+                    // NUNCA sobre las columnas A→M (evita chocar con url_estudiantes/url_plan_abr en N–O).
+                    if (gradosExtra.length) {
+                        const headerExtra = gradosExtra.flatMap(g => {
+                            const suffix = ORDEN_GRADOS[g] ?? g;
+                            return [`grado${suffix}_n`, `grado${suffix}_apl`];
+                        });
+                        const filasExtra = filas.map(f => {
+                            const fila = { codigo_inst: f.codigo_inst, prueba: f.prueba, consultor: f.consultor };
+                            gradosExtra.forEach(g => {
+                                const suffix = ORDEN_GRADOS[g] ?? g;
+                                fila[`grado${suffix}_n`]   = f[`grado${suffix}_n`];
+                                fila[`grado${suffix}_apl`] = f[`grado${suffix}_apl`];
+                            });
+                            return fila;
+                        });
+                        const wsExtra = XLSX.utils.json_to_sheet(filasExtra, {
+                            header: ['codigo_inst', 'prueba', 'consultor', ...headerExtra]
+                        });
+                        XLSX.utils.book_append_sheet(wb, wsExtra, 'Cobertura_GradosExtra');
+                    }
+
                     XLSX.writeFile(wb, `PLC_Cobertura_${momentosSel.join('-')}_${new Date().toISOString().split('T')[0]}.xlsx`);
                     setShowExportModal(false);
-                    mostrarMensaje('success', `✅ ${filas.length} filas exportadas (${momentosSel.join(', ')})`);
+                    const avisoExtra = gradosExtra.length
+                        ? ` — ⚠️ la pestaña "Cobertura_GradosExtra" va en columna P de Participacion, no en A`
+                        : '';
+                    mostrarMensaje('success', `✅ ${filas.length} filas exportadas (${momentosSel.join(', ')})${avisoExtra}`);
                 } catch(e) { mostrarMensaje('error', 'Error: ' + e.message); }
             };
 
@@ -1012,10 +1126,10 @@
                             <div className="text-sm font-semibold text-gray-500 mb-1">📚 Total Inscritos</div>
                             <div className="text-4xl font-extrabold text-gray-800 mb-3">{metricas.totalInscritos.toLocaleString()}</div>
                             <div className="grid grid-cols-2 gap-1">
-                                {[{g:'Tercero',l:'3°',c:'text-green-600'},{g:'Quinto',l:'5°',c:'text-yellow-500'},{g:'Noveno',l:'9°',c:'text-orange-500'},{g:'Once',l:'11°',c:'text-red-600'}].map(({g,l,c}) => (
+                                {gradosDisponibles.map(g => (
                                     <div key={g} className="bg-gray-50 rounded-lg px-2 py-1 text-center">
-                                        <div className={`text-sm font-extrabold ${c}`}>{estudiantesBase.filter(e=>e.grado===g).length.toLocaleString()}</div>
-                                        <div className="text-xs text-gray-400">Grado {l}</div>
+                                        <div className={`text-sm font-extrabold ${infoGrado(g).color}`}>{estudiantesBase.filter(e=>e.grado===g).length.toLocaleString()}</div>
+                                        <div className="text-xs text-gray-400">Grado {infoGrado(g).label}</div>
                                     </div>
                                 ))}
                             </div>
@@ -1028,13 +1142,12 @@
                             const count = m === 'Entrada' ? metricas.entrada : m === 'Control' ? metricas.control : metricas.salida;
                             const pct = metricas.totalInscritos > 0 ? (count / metricas.totalInscritos * 100).toFixed(1) : '0.0';
                             const isActive = filtroMomento === m;
-                            // Conteo por grado en este momento
-                            const porGrado = {
-                                Tercero: estudiantesBase.filter(e => e.grado==='Tercero' && (m==='Entrada'?e.presento_entrada:m==='Control'?e.presento_control:e.presento_salida)).length,
-                                Quinto:  estudiantesBase.filter(e => e.grado==='Quinto'  && (m==='Entrada'?e.presento_entrada:m==='Control'?e.presento_control:e.presento_salida)).length,
-                                Noveno:  estudiantesBase.filter(e => e.grado==='Noveno'  && (m==='Entrada'?e.presento_entrada:m==='Control'?e.presento_control:e.presento_salida)).length,
-                                Once:    estudiantesBase.filter(e => e.grado==='Once'    && (m==='Entrada'?e.presento_entrada:m==='Control'?e.presento_control:e.presento_salida)).length,
-                            };
+                            // Conteo por grado en este momento (dinámico, cubre cualquier grado presente en los datos)
+                            const presentoEnMomento = e => m==='Entrada' ? e.presento_entrada : m==='Control' ? e.presento_control : e.presento_salida;
+                            const porGrado = gradosDisponibles.reduce((acc, g) => {
+                                acc[g] = estudiantesBase.filter(e => e.grado === g && presentoEnMomento(e)).length;
+                                return acc;
+                            }, {});
                             return (
                                 <div key={m}
                                     onClick={() => setFiltroMomento(isActive ? '' : m)}
@@ -1046,10 +1159,10 @@
                                     <div className={`text-xs mb-3 ${isActive ? cfg.text : 'text-gray-400'}`}>{pct}% cobertura</div>
                                     {/* Desglose por grado */}
                                     <div className="grid grid-cols-2 gap-1 mb-3">
-                                        {[{g:'Tercero',l:'3°',c:'text-green-600'},{g:'Quinto',l:'5°',c:'text-yellow-500'},{g:'Noveno',l:'9°',c:'text-orange-500'},{g:'Once',l:'11°',c:'text-red-600'}].map(({g,l,c}) => (
+                                        {gradosDisponibles.map(g => (
                                             <div key={g} className={`rounded-lg px-2 py-1 text-center ${isActive ? 'bg-white bg-opacity-50' : 'bg-gray-50'}`}>
-                                                <div className={`text-sm font-extrabold ${c}`}>{porGrado[g]}</div>
-                                                <div className="text-xs text-gray-400">Grado {l}</div>
+                                                <div className={`text-sm font-extrabold ${infoGrado(g).color}`}>{porGrado[g]}</div>
+                                                <div className="text-xs text-gray-400">Grado {infoGrado(g).label}</div>
                                             </div>
                                         ))}
                                     </div>
@@ -1069,33 +1182,10 @@
                         })}
                     </div>
 
-                    {/* ── Barra de progreso global ── */}
-                    <div className="bg-white rounded-xl shadow-lg p-5">
-                        <div className="flex items-center justify-between mb-3">
-                            <h3 className="font-bold text-gray-700">
-                                📈 Cobertura — <span className={cfgActual.text}>{cfgActual.emoji} {momentoActual}</span>
-                            </h3>
-                            <div className="text-right">
-                                <span className={`text-2xl font-bold ${cfgActual.text}`}>{metricas.porcentajeCobertura.toFixed(1)}%</span>
-                                <div className="text-xs text-gray-500">{metricas.totalEvaluados} / {metricas.totalInscritos} estudiantes</div>
-                            </div>
-                        </div>
-                        <div className="w-full bg-gray-200 rounded-full h-6 overflow-hidden">
-                            <div className={`h-full flex items-center justify-center text-xs font-bold text-white transition-all ${metricas.porcentajeCobertura >= META_COBERTURA ? 'progress-bar-fill success' : 'progress-bar-fill'}`}
-                                style={{ width: `${Math.min(metricas.porcentajeCobertura, 100)}%` }}>
-                                {metricas.porcentajeCobertura >= 8 && `${metricas.porcentajeCobertura.toFixed(1)}%`}
-                            </div>
-                        </div>
-                        <div className="flex justify-between text-xs text-gray-500 mt-2">
-                            <span>Meta: {META_COBERTURA}%</span>
-                            <span>🎯 {metricas.colegiosConMeta} / {metricas.totalColegios} colegios con meta</span>
-                        </div>
-                    </div>
-
                     {/* ── Filtros ── */}
                     <div className="bg-white rounded-xl shadow-lg p-6">
                         <h2 className="text-lg font-bold text-purple-800 mb-4">🔍 Filtros y Exportaciones</h2>
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                             <div>
                                 <label className="block text-sm font-semibold text-gray-700 mb-2">Consultor</label>
                                 <select value={filtroConsultor} onChange={e => setFiltroConsultor(e.target.value)}
@@ -1140,8 +1230,28 @@
                                 <select value={filtroGrado} onChange={e => setFiltroGrado(e.target.value)}
                                     className="w-full px-4 py-3 border-2 border-purple-200 rounded-xl outline-none">
                                     <option value="">Todos los grados</option>
-                                    {GRADOS.map(g => <option key={g} value={g}>{g}</option>)}
+                                    {gradosDisponibles.map(g => <option key={g} value={g}>{g}</option>)}
                                 </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">📅 Calendario</label>
+                                <div className="flex gap-2">
+                                    {['A', 'B'].map(cal => (
+                                        <button key={cal} type="button"
+                                            onClick={() => setFiltroCalendario(filtroCalendario === cal ? '' : cal)}
+                                            className={`flex-1 px-4 py-3 rounded-xl font-bold text-sm border-2 transition ${
+                                                filtroCalendario === cal
+                                                    ? 'bg-indigo-600 text-white border-indigo-600'
+                                                    : 'bg-white text-gray-600 border-gray-300 hover:border-indigo-300'
+                                            }`}>
+                                            Cal {cal}
+                                        </button>
+                                    ))}
+                                    {filtroCalendario && (
+                                        <button type="button" onClick={() => setFiltroCalendario('')}
+                                            className="px-3 py-3 bg-white text-gray-400 border-2 border-gray-300 rounded-xl hover:border-red-300 hover:text-red-500 transition">✖</button>
+                                    )}
+                                </div>
                             </div>
                         </div>
 
@@ -1208,6 +1318,30 @@
                         </div>
                     </div>
 
+                    {/* ── Barra de progreso global ── */}
+                    <div className="bg-white rounded-xl shadow-lg p-5">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="font-bold text-gray-700">
+                                📈 Cobertura — <span className={cfgActual.text}>{cfgActual.emoji} {momentoActual}</span>
+                            </h3>
+                            <div className="text-right">
+                                <span className={`text-2xl font-bold ${cfgActual.text}`}>{metricas.porcentajeCobertura.toFixed(1)}%</span>
+                                <div className="text-xs text-gray-500">{metricas.totalEvaluados} / {metricas.totalInscritos} estudiantes</div>
+                            </div>
+                        </div>
+                        <div className="w-full bg-gray-200 rounded-full h-6 overflow-hidden">
+                            <div className={`h-full flex items-center justify-center text-xs font-bold text-white transition-all ${metricas.porcentajeCobertura >= META_COBERTURA ? 'progress-bar-fill success' : 'progress-bar-fill'}`}
+                                style={{ width: `${Math.min(metricas.porcentajeCobertura, 100)}%` }}>
+                                {metricas.porcentajeCobertura >= 8 && `${metricas.porcentajeCobertura.toFixed(1)}%`}
+                            </div>
+                        </div>
+                        <div className="flex justify-between text-xs text-gray-500 mt-2">
+                            <span>Meta: {META_COBERTURA}%</span>
+                            <span>🎯 {metricas.colegiosConMeta} / {metricas.totalColegios} colegios con meta</span>
+                        </div>
+                    </div>
+
+
                     {/* ── Ranking Consultores con Podio ── */}
                     <div className="bg-white rounded-xl shadow-lg p-6">
                         <div className="flex items-center justify-between mb-6">
@@ -1227,6 +1361,7 @@
                                 const baseAll = estudiantesEnriquecidos.filter(est => {
                                     if (filtroInstitucion && est.codigoInstitucion !== filtroInstitucion) return false;
                                     if (filtroGrado && est.grado !== filtroGrado) return false;
+                                    if (filtroCalendario && (est.calendario || '').toUpperCase() !== filtroCalendario) return false;
                                     return true;
                                 });
                                 const instAll = new Map();
@@ -1346,19 +1481,17 @@
                                             </div>
                                             {/* Desglose por GRADO con momento activo */}
                                             {(() => {
-                                                const gradoColors2 = { 'Tercero':'text-green-600','Quinto':'text-yellow-500','Noveno':'text-orange-500','Once':'text-red-600' };
-                                                const gradoLabels2 = { 'Tercero':'3°','Quinto':'5°','Noveno':'9°','Once':'11°' };
                                                 return (
-                                                    <div className="grid grid-cols-4 gap-2 mb-3">
-                                                        {GRADOS.map(g => {
+                                                    <div className="grid gap-2 mb-3" style={{ gridTemplateColumns: `repeat(${gradosDisponibles.length}, minmax(0,1fr))` }}>
+                                                        {gradosDisponibles.map(g => {
                                                             const inscrG = estudiantesBase.filter(e => e.consultor === cons.consultor && e.grado === g).length;
                                                             const evalG  = estudiantesBase.filter(e => e.consultor === cons.consultor && e.grado === g && presentoEn(e, filtroMomento)).length;
                                                             const pctG   = inscrG > 0 ? (evalG/inscrG*100).toFixed(0) : '0';
                                                             return (
                                                                 <div key={g} className="bg-white bg-opacity-60 rounded-lg p-2 text-center">
-                                                                    <div className={`text-base font-extrabold ${gradoColors2[g]}`}>{evalG}</div>
+                                                                    <div className={`text-base font-extrabold ${infoGrado(g).color}`}>{evalG}</div>
                                                                     <div className="text-xs text-gray-400">/{inscrG}</div>
-                                                                    <div className="text-xs text-gray-500">Grado {gradoLabels2[g]}</div>
+                                                                    <div className="text-xs text-gray-500">Grado {infoGrado(g).label}</div>
                                                                     <div className={`text-xs font-bold ${pctG >= META_COBERTURA ? 'text-green-600' : 'text-gray-400'}`}>{pctG}%</div>
                                                                 </div>
                                                             );
@@ -1413,22 +1546,18 @@
                                         <th className="px-3 py-3 text-center font-semibold text-blue-700">📘 Entrada</th>
                                         <th className="px-3 py-3 text-center font-semibold text-amber-700">📙 Control</th>
                                         <th className="px-3 py-3 text-center font-semibold text-green-700">📗 Salida</th>
-                                        <th className="px-3 py-3 text-center font-semibold text-green-600">3°</th>
-                                        <th className="px-3 py-3 text-center font-semibold text-yellow-600">5°</th>
-                                        <th className="px-3 py-3 text-center font-semibold text-orange-600">9°</th>
-                                        <th className="px-3 py-3 text-center font-semibold text-red-600">11°</th>
+                                        {gradosDisponibles.map(g => (
+                                            <th key={g} className={`px-3 py-3 text-center font-semibold ${infoGrado(g).color}`}>{infoGrado(g).label}</th>
+                                        ))}
                                         <th className="px-3 py-3 text-left font-semibold text-gray-700">Progreso</th>
                                         <th className="px-3 py-3 text-center font-semibold text-gray-700">Acciones</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-200">
                                     {institucionesFiltradas.map((inst, idx) => {
-                                        const gradoCols = [
-                                            { g: 'Tercero', l: '3°', tc: 'text-green-600' },
-                                            { g: 'Quinto',  l: '5°', tc: 'text-yellow-600' },
-                                            { g: 'Noveno',  l: '9°', tc: 'text-orange-600' },
-                                            { g: 'Once',    l: '11°',tc: 'text-red-600' },
-                                        ];
+                                        // Misma fuente (gradosDisponibles + infoGrado) que generó los <th> de arriba —
+                                        // header y body quedan sincronizados automáticamente, sin lista duplicada.
+                                        const gradoCols = gradosDisponibles.map(g => ({ g, l: infoGrado(g).label, tc: infoGrado(g).color }));
                                         return (
                                         <tr key={idx} className="hover:bg-purple-50">
                                             <td className="px-3 py-3 text-gray-900 font-medium text-xs max-w-40">{inst.nombre}</td>
